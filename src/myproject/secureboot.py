@@ -1,8 +1,11 @@
 """UEFI Secure Boot automation for Manjaro/Arch Linux.
 
-Automates MOK (Machine Owner Key) generation, kernel and DKMS module
-signing, MOK enrollment, and pacman hook installation for persistent
-Secure Boot support across kernel updates.
+Primary backend: ``sbctl`` — manages key creation, enrollment, signing,
+and verification natively on Arch-based systems.
+
+Legacy backend: MOK (Machine Owner Key) — automates key generation,
+kernel and DKMS module signing, MOK enrollment, and pacman hook
+installation.  Retained for compatibility with non-sbctl workflows.
 
 Integrates with :mod:`myproject.kernel_builder` for shared subprocess
 helpers and validation.
@@ -98,6 +101,21 @@ SHIM_SEARCH_PATHS: tuple[Path, ...] = (
     Path("/boot/efi/EFI/BOOT/BOOTX64.EFI"),
     Path("/usr/share/shim-signed/shimx64.efi"),
     Path("/usr/share/shim/shimx64.efi"),
+)
+
+# ---------------------------------------------------------------------------
+# sbctl constants
+# ---------------------------------------------------------------------------
+
+SBCTL_KEYS_DIR: Path = Path("/var/lib/sbctl/keys")
+
+SBCTL_EFI_PATHS: tuple[Path, ...] = (
+    Path("/boot/efi/EFI/Manjaro/grubx64.efi"),
+    Path("/boot/efi/EFI/BOOT/BOOTX64.EFI"),
+    Path("/boot/vmlinuz-linux"),
+    Path("/boot/vmlinuz-linux-lts"),
+    Path("/boot/efi/EFI/Manjaro/fbx64.efi"),
+    Path("/boot/efi/EFI/Manjaro/mmx64.efi"),
 )
 
 # SECURITY: Allowlist for paths embedded in root-executed templates.
@@ -198,6 +216,9 @@ def check_efi_shim_chain() -> dict[str, object]:
 
 def generate_mok_keys(key_dir: str | Path) -> tuple[Path, Path]:
     """Generate an RSA MOK key pair if not already present.
+
+    .. deprecated:: Legacy MOK workflow. Prefer :func:`sbctl_create_keys`
+       for Manjaro/Arch systems.
 
     Args:
         key_dir: Directory to store MOK.key and MOK.crt.
@@ -521,6 +542,9 @@ def is_mok_enrolled(cert_path: str | Path) -> bool:
 def enroll_mok(cert_path: str | Path) -> None:
     """Enroll a MOK certificate via ``mokutil --import`` (DER format).
 
+    .. deprecated:: Legacy MOK workflow. Prefer :func:`sbctl_enroll_keys`
+       for Manjaro/Arch systems.
+
     This will prompt the user for a one-time password that must be
     entered on next reboot in the MOK Manager EFI screen.
 
@@ -678,6 +702,9 @@ def check_status(key_dir: str | Path | None = None) -> dict[str, object]:
 def setup_secureboot(key_dir: str | Path) -> dict[str, object]:
     """Full Secure Boot setup: preflight → keys → sign → enroll → hooks.
 
+    .. deprecated:: Legacy MOK workflow. Prefer :func:`setup_secureboot_sbctl`
+       for Manjaro/Arch systems.
+
     Args:
         key_dir: Directory to store/read MOK keys.
 
@@ -710,5 +737,244 @@ def setup_secureboot(key_dir: str | Path) -> dict[str, object]:
         "shim_warnings": shim_status["warnings"],
     }
     log.info("=== Secure Boot setup complete ===")
+    log.info("Summary: %s", summary)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# sbctl backend (primary for Manjaro/Arch)
+# ---------------------------------------------------------------------------
+
+
+def _ensure_sbctl() -> None:
+    """Verify that ``sbctl`` is on PATH.
+
+    Raises:
+        BuildError: If sbctl is not installed.
+    """
+    if shutil.which("sbctl") is None:
+        raise BuildError("sbctl not found. Install with: sudo pacman -S sbctl")
+
+
+def sbctl_status() -> dict[str, object]:
+    """Query ``sbctl status`` and parse its output.
+
+    Returns:
+        Dict with ``installed``, ``setup_mode``, ``secure_boot``, and
+        ``vendor_keys`` fields.
+
+    Raises:
+        BuildError: If sbctl is not installed.
+    """
+    _ensure_sbctl()
+    result = run_cmd(["sbctl", "status"], check=False, capture=True)
+    output = result.stdout
+
+    installed = "sbctl is installed" in output
+    setup_mode = (
+        "Setup Mode:" in output and "\u2713" in output.split("Setup Mode:")[1].split("\n")[0]
+    )
+    secure_boot = (
+        "Secure Boot:" in output and "\u2713" in output.split("Secure Boot:")[1].split("\n")[0]
+    )
+
+    vendor_keys = ""
+    for line in output.splitlines():
+        if line.strip().startswith("Vendor Keys:"):
+            vendor_keys = line.split(":", 1)[1].strip()
+            break
+
+    status: dict[str, object] = {
+        "installed": installed,
+        "setup_mode": setup_mode,
+        "secure_boot": secure_boot,
+        "vendor_keys": vendor_keys,
+    }
+    log.info("sbctl status: %s", status)
+    return status
+
+
+def sbctl_create_keys() -> str:
+    """Create Secure Boot signing keys via ``sbctl create-keys``.
+
+    Keys are stored in ``/var/lib/sbctl/keys/``. Idempotent — if keys
+    already exist, returns ``"already-exists"`` without overwriting.
+
+    Returns:
+        ``"created"`` if new keys were generated, ``"already-exists"``
+        if the key directory was already populated.
+
+    Raises:
+        BuildError: If sbctl is not installed or key creation fails.
+    """
+    _ensure_sbctl()
+    if SBCTL_KEYS_DIR.exists() and any(SBCTL_KEYS_DIR.iterdir()):
+        log.info("sbctl keys already exist in %s", SBCTL_KEYS_DIR)
+        return "already-exists"
+    log.info("Creating sbctl signing keys ...")
+    run_cmd(["sbctl", "create-keys"])
+    log.info("sbctl keys created in %s", SBCTL_KEYS_DIR)
+    return "created"
+
+
+def sbctl_enroll_keys(*, keep_microsoft: bool = True) -> None:
+    """Enroll sbctl keys into firmware via ``sbctl enroll-keys``.
+
+    Requires the system to be in UEFI Setup Mode. If Setup Mode is not
+    enabled, sbctl will fail with an error.
+
+    Args:
+        keep_microsoft: If True, pass ``-m`` to keep Microsoft vendor keys
+            alongside the custom keys. Recommended for dual-boot and
+            driver compatibility.
+
+    Raises:
+        BuildError: If sbctl is not installed, Setup Mode is disabled,
+            or enrollment fails.
+    """
+    _ensure_sbctl()
+    status = sbctl_status()
+    if not status["setup_mode"]:
+        raise BuildError(
+            "UEFI Setup Mode is not enabled. Enter BIOS/UEFI settings and "
+            "enable Setup Mode (clear Secure Boot keys) before enrolling."
+        )
+    cmd: list[str] = ["sbctl", "enroll-keys"]
+    if keep_microsoft:
+        cmd.append("-m")
+    log.info("Enrolling sbctl keys (keep_microsoft=%s) ...", keep_microsoft)
+    run_cmd(cmd)
+    log.info("sbctl keys enrolled successfully")
+
+
+def sbctl_sign(path: str | Path, *, save: bool = True) -> None:
+    """Sign a single EFI binary or kernel with ``sbctl sign``.
+
+    Args:
+        path: Path to the file to sign.
+        save: If True, pass ``-s`` so sbctl records the file for
+            automatic re-signing on updates.
+
+    Raises:
+        FileNotFoundError: If the target file does not exist.
+        BuildError: If sbctl is not installed or signing fails.
+    """
+    _ensure_sbctl()
+    target = Path(path).resolve()
+    if not target.exists():
+        raise FileNotFoundError(f"File not found: {target}")
+
+    _validate_safe_path(target, "sign target")
+
+    cmd: list[str] = ["sbctl", "sign"]
+    if save:
+        cmd.append("-s")
+    cmd.append(str(target))
+
+    log.info("Signing with sbctl: %s (save=%s)", target, save)
+    run_cmd(cmd)
+    log.info("Signed: %s", target)
+
+
+def sbctl_sign_all() -> list[Path]:
+    """Sign all common EFI binaries and kernels with ``sbctl sign -s``.
+
+    Iterates :data:`SBCTL_EFI_PATHS` and signs each file that exists on
+    disk. Missing files are skipped with a warning.
+
+    Returns:
+        List of paths that were successfully signed.
+
+    Raises:
+        BuildError: If sbctl is not installed or any signing fails.
+    """
+    _ensure_sbctl()
+    signed: list[Path] = []
+
+    # Static EFI paths
+    for efi_path in SBCTL_EFI_PATHS:
+        if not efi_path.exists():
+            log.warning("Skipping (not found): %s", efi_path)
+            continue
+        sbctl_sign(efi_path, save=True)
+        signed.append(efi_path)
+
+    # Dynamic kernel images
+    for vmlinuz in sorted(BOOT_DIR.glob("vmlinuz-*")):
+        if vmlinuz in signed:
+            continue
+        sbctl_sign(vmlinuz, save=True)
+        signed.append(vmlinuz)
+
+    log.info("sbctl signed %d file(s)", len(signed))
+    return signed
+
+
+def sbctl_verify() -> dict[str, bool]:
+    """Run ``sbctl verify`` and parse per-file results.
+
+    Returns:
+        Dict mapping file path to True (signed) or False (unsigned).
+
+    Raises:
+        BuildError: If sbctl is not installed.
+    """
+    _ensure_sbctl()
+    result = run_cmd(["sbctl", "verify"], check=False, capture=True)
+    files: dict[str, bool] = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("\u2713"):
+            # "✓ /path/file.efi is signed"
+            path = line.split()[1] if len(line.split()) >= 2 else ""
+            files[path] = True
+        elif line.startswith("\u2717"):
+            # "✗ /path/file.efi is not signed"
+            path = line.split()[1] if len(line.split()) >= 2 else ""
+            files[path] = False
+
+    unsigned = [p for p, signed in files.items() if not signed]
+    if unsigned:
+        log.warning("Unsigned files: %s", unsigned)
+    else:
+        log.info("All registered files are signed")
+    return files
+
+
+def setup_secureboot_sbctl(*, keep_microsoft: bool = True) -> dict[str, object]:
+    """Full sbctl-based Secure Boot setup: keys \u2192 sign \u2192 enroll.
+
+    This is the primary orchestrator for Manjaro/Arch systems using
+    ``sbctl`` instead of the legacy MOK workflow.
+
+    Args:
+        keep_microsoft: Keep Microsoft vendor keys during enrollment.
+
+    Returns:
+        Summary dict with setup results.
+
+    Raises:
+        BuildError: If any step fails.
+    """
+    log.info("=== sbctl Secure Boot setup starting ===")
+
+    _ensure_sbctl()
+    status = sbctl_status()
+
+    key_result = sbctl_create_keys()
+    sbctl_enroll_keys(keep_microsoft=keep_microsoft)
+    signed = sbctl_sign_all()
+    verification = sbctl_verify()
+
+    summary: dict[str, object] = {
+        "backend": "sbctl",
+        "keys_dir": str(SBCTL_KEYS_DIR),
+        "keys_status": key_result,
+        "signed_files": [str(p) for p in signed],
+        "verification": verification,
+        "initial_status": status,
+        "keep_microsoft": keep_microsoft,
+    }
+    log.info("=== sbctl Secure Boot setup complete ===")
     log.info("Summary: %s", summary)
     return summary

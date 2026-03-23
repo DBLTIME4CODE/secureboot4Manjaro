@@ -17,6 +17,7 @@ from myproject.secureboot import (
     PACMAN_HOOK_NAME,
     REQUIRED_TOOLS,
     _ensure_der_cert,
+    _ensure_sbctl,
     _find_sign_file,
     _kernel_version_from_module,
     _validate_safe_path,
@@ -28,7 +29,14 @@ from myproject.secureboot import (
     install_dkms_signing_hook,
     install_pacman_hook,
     is_mok_enrolled,
+    sbctl_create_keys,
+    sbctl_enroll_keys,
+    sbctl_sign,
+    sbctl_sign_all,
+    sbctl_status,
+    sbctl_verify,
     setup_secureboot,
+    setup_secureboot_sbctl,
     sign_all_kernels,
     sign_dkms_modules,
     sign_kernel,
@@ -826,3 +834,419 @@ class TestFindSignFile:
             # Can't easily test the real function since it hardcodes system paths.
             # Verified indirectly via sign_dkms_modules tests.
             pass
+
+
+# ===================================================================
+# _ensure_sbctl
+# ===================================================================
+
+
+class TestEnsureSbctl:
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    def test_sbctl_present(self, mock_which: MagicMock) -> None:
+        _ensure_sbctl()  # should not raise
+
+    @patch("myproject.secureboot.shutil.which", return_value=None)
+    def test_sbctl_missing_raises(self, mock_which: MagicMock) -> None:
+        with pytest.raises(BuildError, match="sbctl not found"):
+            _ensure_sbctl()
+
+
+# ===================================================================
+# sbctl_status
+# ===================================================================
+
+
+class TestSbctlStatus:
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    def test_parses_full_status(self, mock_run: MagicMock, mock_which: MagicMock) -> None:
+        mock_run.return_value = MagicMock(
+            stdout=(
+                "Installed:\t\u2713 sbctl is installed\n"
+                "Owner GUID:\tsome-guid\n"
+                "Setup Mode:\t\u2713 Enabled\n"
+                "Secure Boot:\t\u2717 Disabled\n"
+                "Vendor Keys:\tmicrosoft\n"
+            ),
+            returncode=0,
+        )
+        result = sbctl_status()
+        assert result["installed"] is True
+        assert result["setup_mode"] is True
+        assert result["secure_boot"] is False
+        assert result["vendor_keys"] == "microsoft"
+
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    def test_parses_secure_boot_enabled(self, mock_run: MagicMock, mock_which: MagicMock) -> None:
+        mock_run.return_value = MagicMock(
+            stdout=(
+                "Installed:\t\u2713 sbctl is installed\n"
+                "Setup Mode:\t\u2717 Disabled\n"
+                "Secure Boot:\t\u2713 Enabled\n"
+                "Vendor Keys:\tmicrosoft\n"
+            ),
+            returncode=0,
+        )
+        result = sbctl_status()
+        assert result["secure_boot"] is True
+        assert result["setup_mode"] is False
+
+    @patch("myproject.secureboot.shutil.which", return_value=None)
+    def test_raises_when_sbctl_missing(self, mock_which: MagicMock) -> None:
+        with pytest.raises(BuildError, match="sbctl not found"):
+            sbctl_status()
+
+
+# ===================================================================
+# sbctl_create_keys
+# ===================================================================
+
+
+class TestSbctlCreateKeys:
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    @patch("myproject.secureboot.SBCTL_KEYS_DIR")
+    def test_creates_new_keys(
+        self, mock_keys_dir: MagicMock, mock_run: MagicMock, mock_which: MagicMock
+    ) -> None:
+        mock_keys_dir.exists.return_value = False
+        result = sbctl_create_keys()
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["sbctl", "create-keys"]
+        assert result == "created"
+
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    @patch("myproject.secureboot.SBCTL_KEYS_DIR")
+    def test_returns_already_exists(
+        self, mock_keys_dir: MagicMock, mock_run: MagicMock, mock_which: MagicMock
+    ) -> None:
+        mock_keys_dir.exists.return_value = True
+        mock_keys_dir.iterdir.return_value = iter([Path("/var/lib/sbctl/keys/db")])
+        result = sbctl_create_keys()
+        mock_run.assert_not_called()
+        assert result == "already-exists"
+
+    @patch("myproject.secureboot.shutil.which", return_value=None)
+    def test_raises_when_missing(self, mock_which: MagicMock) -> None:
+        with pytest.raises(BuildError, match="sbctl not found"):
+            sbctl_create_keys()
+
+
+# ===================================================================
+# sbctl_enroll_keys
+# ===================================================================
+
+
+class TestSbctlEnrollKeys:
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    @patch("myproject.secureboot.sbctl_status")
+    def test_enroll_with_microsoft(
+        self, mock_status: MagicMock, mock_run: MagicMock, mock_which: MagicMock
+    ) -> None:
+        mock_status.return_value = {
+            "installed": True,
+            "setup_mode": True,
+            "secure_boot": False,
+            "vendor_keys": "",
+        }
+        sbctl_enroll_keys(keep_microsoft=True)
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["sbctl", "enroll-keys", "-m"]
+
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    @patch("myproject.secureboot.sbctl_status")
+    def test_enroll_without_microsoft(
+        self, mock_status: MagicMock, mock_run: MagicMock, mock_which: MagicMock
+    ) -> None:
+        mock_status.return_value = {
+            "installed": True,
+            "setup_mode": True,
+            "secure_boot": False,
+            "vendor_keys": "",
+        }
+        sbctl_enroll_keys(keep_microsoft=False)
+        cmd = mock_run.call_args[0][0]
+        assert cmd == ["sbctl", "enroll-keys"]
+        assert "-m" not in cmd
+
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.sbctl_status")
+    def test_raises_when_setup_mode_disabled(
+        self, mock_status: MagicMock, mock_which: MagicMock
+    ) -> None:
+        mock_status.return_value = {
+            "installed": True,
+            "setup_mode": False,
+            "secure_boot": True,
+            "vendor_keys": "microsoft",
+        }
+        with pytest.raises(BuildError, match="Setup Mode is not enabled"):
+            sbctl_enroll_keys()
+
+    @patch("myproject.secureboot.shutil.which", return_value=None)
+    def test_raises_when_missing(self, mock_which: MagicMock) -> None:
+        with pytest.raises(BuildError, match="sbctl not found"):
+            sbctl_enroll_keys()
+
+
+# ===================================================================
+# sbctl_sign
+# ===================================================================
+
+
+class TestSbctlSign:
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    def test_sign_with_save(
+        self, mock_run: MagicMock, mock_which: MagicMock, tmp_path: Path
+    ) -> None:
+        efi = tmp_path / "grubx64.efi"
+        efi.write_text("efi")
+        sbctl_sign(efi, save=True)
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "sbctl"
+        assert cmd[1] == "sign"
+        assert "-s" in cmd
+        assert str(efi.resolve()) in cmd
+
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    def test_sign_without_save(
+        self, mock_run: MagicMock, mock_which: MagicMock, tmp_path: Path
+    ) -> None:
+        efi = tmp_path / "grubx64.efi"
+        efi.write_text("efi")
+        sbctl_sign(efi, save=False)
+        cmd = mock_run.call_args[0][0]
+        assert "-s" not in cmd
+
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    def test_missing_file_raises(self, mock_which: MagicMock, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError, match="File not found"):
+            sbctl_sign(tmp_path / "nonexistent.efi")
+
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    def test_unsafe_path_raises(self, mock_which: MagicMock, tmp_path: Path) -> None:
+        bad = tmp_path / "evil;rm -rf"
+        bad.mkdir(parents=True, exist_ok=True)
+        target = bad / "file.efi"
+        target.write_text("efi")
+        with pytest.raises(BuildError, match="unsafe characters"):
+            sbctl_sign(target)
+
+    @patch("myproject.secureboot.shutil.which", return_value=None)
+    def test_raises_when_sbctl_missing(self, mock_which: MagicMock, tmp_path: Path) -> None:
+        efi = tmp_path / "grubx64.efi"
+        efi.write_text("efi")
+        with pytest.raises(BuildError, match="sbctl not found"):
+            sbctl_sign(efi)
+
+
+# ===================================================================
+# sbctl_sign_all
+# ===================================================================
+
+
+class TestSbctlSignAll:
+    @patch("myproject.secureboot.sbctl_sign")
+    @patch("myproject.secureboot.BOOT_DIR")
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    def test_signs_existing_files(
+        self,
+        mock_which: MagicMock,
+        mock_boot: MagicMock,
+        mock_sign: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import myproject.secureboot as sb
+
+        efi1 = tmp_path / "grubx64.efi"
+        efi2 = tmp_path / "BOOTX64.EFI"
+        efi1.write_text("efi")
+        efi2.write_text("efi")
+        monkeypatch.setattr(sb, "SBCTL_EFI_PATHS", (efi1, efi2, tmp_path / "nonexistent.efi"))
+        mock_boot.glob.return_value = []
+
+        result = sbctl_sign_all()
+        assert len(result) == 2
+        assert mock_sign.call_count == 2
+
+    @patch("myproject.secureboot.sbctl_sign")
+    @patch("myproject.secureboot.BOOT_DIR")
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    def test_signs_vmlinuz_kernels(
+        self,
+        mock_which: MagicMock,
+        mock_boot: MagicMock,
+        mock_sign: MagicMock,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import myproject.secureboot as sb
+
+        monkeypatch.setattr(sb, "SBCTL_EFI_PATHS", ())
+        vmlinuz = tmp_path / "vmlinuz-linux"
+        vmlinuz.write_text("kernel")
+        mock_boot.glob.return_value = [vmlinuz]
+
+        result = sbctl_sign_all()
+        assert len(result) == 1
+        assert result[0] == vmlinuz
+        mock_sign.assert_called_once_with(vmlinuz, save=True)
+
+    @patch("myproject.secureboot.sbctl_sign")
+    @patch("myproject.secureboot.BOOT_DIR")
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    def test_skips_missing_files(
+        self,
+        mock_which: MagicMock,
+        mock_boot: MagicMock,
+        mock_sign: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import myproject.secureboot as sb
+
+        monkeypatch.setattr(sb, "SBCTL_EFI_PATHS", (Path("/nonexistent/a.efi"),))
+        mock_boot.glob.return_value = []
+        result = sbctl_sign_all()
+        assert result == []
+        mock_sign.assert_not_called()
+
+    @patch("myproject.secureboot.shutil.which", return_value=None)
+    def test_raises_when_sbctl_missing(self, mock_which: MagicMock) -> None:
+        with pytest.raises(BuildError, match="sbctl not found"):
+            sbctl_sign_all()
+
+
+# ===================================================================
+# sbctl_verify
+# ===================================================================
+
+
+class TestSbctlVerify:
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    def test_parses_signed_files(self, mock_run: MagicMock, mock_which: MagicMock) -> None:
+        mock_run.return_value = MagicMock(
+            stdout=(
+                "\u2713 /boot/efi/EFI/Manjaro/grubx64.efi is signed\n"
+                "\u2713 /boot/vmlinuz-linux is signed\n"
+            ),
+            returncode=0,
+        )
+        result = sbctl_verify()
+        assert result["/boot/efi/EFI/Manjaro/grubx64.efi"] is True
+        assert result["/boot/vmlinuz-linux"] is True
+
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    def test_parses_unsigned_files(self, mock_run: MagicMock, mock_which: MagicMock) -> None:
+        mock_run.return_value = MagicMock(
+            stdout=(
+                "\u2713 /boot/vmlinuz-linux is signed\n"
+                "\u2717 /boot/vmlinuz-linux-lts is not signed\n"
+            ),
+            returncode=1,
+        )
+        result = sbctl_verify()
+        assert result["/boot/vmlinuz-linux"] is True
+        assert result["/boot/vmlinuz-linux-lts"] is False
+
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    @patch("myproject.secureboot.run_cmd")
+    def test_empty_output(self, mock_run: MagicMock, mock_which: MagicMock) -> None:
+        mock_run.return_value = MagicMock(stdout="", returncode=0)
+        result = sbctl_verify()
+        assert result == {}
+
+    @patch("myproject.secureboot.shutil.which", return_value=None)
+    def test_raises_when_sbctl_missing(self, mock_which: MagicMock) -> None:
+        with pytest.raises(BuildError, match="sbctl not found"):
+            sbctl_verify()
+
+
+# ===================================================================
+# setup_secureboot_sbctl (orchestrator)
+# ===================================================================
+
+
+class TestSetupSecurebootSbctl:
+    @patch("myproject.secureboot.sbctl_verify")
+    @patch("myproject.secureboot.sbctl_sign_all")
+    @patch("myproject.secureboot.sbctl_enroll_keys")
+    @patch("myproject.secureboot.sbctl_create_keys")
+    @patch("myproject.secureboot.sbctl_status")
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    def test_full_pipeline(
+        self,
+        mock_which: MagicMock,
+        mock_status: MagicMock,
+        mock_create: MagicMock,
+        mock_enroll: MagicMock,
+        mock_sign_all: MagicMock,
+        mock_verify: MagicMock,
+    ) -> None:
+        mock_status.return_value = {
+            "installed": True,
+            "setup_mode": True,
+            "secure_boot": False,
+            "vendor_keys": "microsoft",
+        }
+        mock_create.return_value = "created"
+        mock_sign_all.return_value = [Path("/boot/vmlinuz-linux")]
+        mock_verify.return_value = {"/boot/vmlinuz-linux": True}
+
+        result = setup_secureboot_sbctl(keep_microsoft=True)
+
+        mock_status.assert_called_once()
+        mock_create.assert_called_once()
+        mock_enroll.assert_called_once_with(keep_microsoft=True)
+        mock_sign_all.assert_called_once()
+        mock_verify.assert_called_once()
+
+        assert result["backend"] == "sbctl"
+        assert result["keys_status"] == "created"
+        assert result["keep_microsoft"] is True
+        assert len(result["signed_files"]) == 1  # type: ignore[arg-type]
+
+    @patch("myproject.secureboot.sbctl_verify")
+    @patch("myproject.secureboot.sbctl_sign_all")
+    @patch("myproject.secureboot.sbctl_enroll_keys")
+    @patch("myproject.secureboot.sbctl_create_keys")
+    @patch("myproject.secureboot.sbctl_status")
+    @patch("myproject.secureboot.shutil.which", return_value="/usr/bin/sbctl")
+    def test_no_microsoft_keys(
+        self,
+        mock_which: MagicMock,
+        mock_status: MagicMock,
+        mock_create: MagicMock,
+        mock_enroll: MagicMock,
+        mock_sign_all: MagicMock,
+        mock_verify: MagicMock,
+    ) -> None:
+        mock_status.return_value = {
+            "installed": True,
+            "setup_mode": True,
+            "secure_boot": False,
+            "vendor_keys": "",
+        }
+        mock_create.return_value = "already-exists"
+        mock_sign_all.return_value = []
+        mock_verify.return_value = {}
+
+        result = setup_secureboot_sbctl(keep_microsoft=False)
+        mock_enroll.assert_called_once_with(keep_microsoft=False)
+        assert result["keep_microsoft"] is False
+        assert result["keys_status"] == "already-exists"
+
+    @patch("myproject.secureboot.shutil.which", return_value=None)
+    def test_raises_when_sbctl_missing(self, mock_which: MagicMock) -> None:
+        with pytest.raises(BuildError, match="sbctl not found"):
+            setup_secureboot_sbctl()
