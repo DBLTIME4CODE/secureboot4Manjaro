@@ -1,101 +1,139 @@
 ﻿# Secure Boot Auto-Signing for Manjaro/Arch Linux
 
-Automates UEFI Secure Boot on Manjaro and Arch Linux - generates MOK keys, signs
-kernels and DKMS modules, enrolls the certificate, and installs pacman hooks so
-everything stays signed after updates.
+> **STATUS: INCOMPLETE**  Keys enroll and binaries sign successfully via sbctl, but Manjaro's GRUB has a compiled-in shim_lock verifier that blocks boot under Secure Boot. The next step is either switching to systemd-boot or installing a patched GRUB from AUR. See Known Issues below.
 
 ---
 
-## What It Does
+## What It Does (when complete)
 
-| Step | What happens |
-|------|-------------|
-| **1. EFI preflight** | Checks whether shim is installed and in the EFI boot chain (advisory) |
-| **2. Key generation** | Creates RSA 4096 MOK key pair (MOK.key + MOK.crt + DER MOK.cer) with 10-year validity |
-| **3. Kernel signing** | Signs every /boot/vmlinuz-* with sbsign (PE/COFF format for EFI binaries) |
-| **4. Module signing** | Signs .ko and .ko.zst DKMS modules using the kernel sign-file tool (PKCS#7 appended signatures) |
-| **5. MOK enrollment** | Registers the DER certificate via mokutil --import (one-time, prompts for password) |
-| **6. Kernel hook** | Installs /etc/pacman.d/hooks/99-secureboot.hook - auto-signs kernels on every update |
-| **7. DKMS hook** | Installs /etc/pacman.d/hooks/98-secureboot-dkms.hook - auto-signs modules after DKMS rebuilds |
+| Step | What happens | Status |
+|------|-------------|--------|
+| **1. sbctl key creation** | Creates Secure Boot signing keys | Working |
+| **2. Key enrollment** | Enrolls keys directly into UEFI firmware db (no shim/MOK needed) | Working |
+| **3. EFI signing** | Signs all EFI binaries (GRUB, bootloader, kernel) via sbctl | Working |
+| **4. Persistent signing** | sbctl auto-signs on kernel updates via -s flag | Working |
+| **5. Boot with Secure Boot ON** | GRUB loads kernel under Secure Boot | **BLOCKED** |
 
-After setup, enable Secure Boot in BIOS and you are done.
+## Known Issues
+
+### GRUB shim_lock verifier (BLOCKING)
+
+Manjaro's GRUB package has a shim_lock verifier **compiled into the binary**. When Secure Boot is enabled, GRUB calls shim_lock_verifier_init() which fails because there is no shim in the boot chain (sbctl uses direct firmware key enrollment instead). The --disable-shim-lock flag and GRUB_DISABLE_SHIM_LOCK config option do not remove the compiled-in verifier.
+
+**Error messages seen:**
+- kern/efi/sb.c:shim_lock_verifier_init:177: prohibited by secure boot policy
+- kern/verifiers.c:grub_verifiers_open:119: verification requested but nobody cares
+
+**Potential fixes (not yet attempted):**
+1. Switch to **systemd-boot** (no shim_lock, works cleanly with sbctl)
+2. Install **grub-no-verifiers** or patched GRUB from AUR
+3. Use **Unified Kernel Images (UKI)** which bypass GRUB entirely
+
+---
+
+## What Works Today
+
+Everything below works correctly with Secure Boot OFF:
+
+- sbctl create-keys  generates signing keys
+- sbctl enroll-keys -m  enrolls into firmware (requires Setup Mode)
+- sbctl sign -s  signs and persists EFI binaries
+- sbctl verify  confirms all binaries are signed
+- Python secureboot module  signs kernels (sbsign) and modules (sign-file)
+- Pacman hooks  auto-sign on kernel/module updates
 
 ---
 
 ## Requirements
 
-- **Manjaro** or **Arch Linux** (uses pacman, sbsigntools, mokutil)
-- **Python 3.10+**
-- **Root access** via sudo
-- **linux-headers** package (provides sign-file for module signing)
-- **zstd** (if your system has .ko.zst compressed modules - Manjaro default)
+- **Manjaro** or **Arch Linux**
+- **sbctl** (pacman -S sbctl)
+- **Python 3.10+** (for the Python module)
+- **linux-headers** (for sign-file module signing)
+- **zstd** (for .ko.zst compressed modules)
 
 ---
 
-## Quick Start
+## Quick Start (current state)
 
 ```bash
-# 1. Install dependencies
-sudo pacman -S sbsigntools mokutil openssl linux-headers zstd python
-
-# 2. Clone
+# Clone
 git clone https://github.com/DBLTIME4CODE/secureboot4Manjaro.git
 cd secureboot4Manjaro
 
-# 3. Run the setup
-sudo PYTHONPATH=src python -c "from myproject.secureboot import setup_secureboot; setup_secureboot('/var/lib/secureboot')"
+# Step 1: Install sbctl and sign everything
+sudo bash sbctl-setup.sh
 
-# 4. Enter a one-time MOK enrollment password when prompted
-# 5. Reboot - MOK Manager appears - enter password - Enroll MOK
-# 6. Enable Secure Boot in BIOS
+# Step 2: Sign any remaining unsigned files
+sudo bash sign-remaining.sh
+
+# Step 3: Enter BIOS -> Security -> Secure Boot -> Clear/Reset keys -> Save -> Boot Manjaro
+
+# Step 4: Enroll your keys into firmware
+sudo bash enroll-keys.sh
+
+# Step 5: Fix GRUB shim_lock (reinstall without verifier)
+sudo bash fix-grub-verifier.sh
+
+# Step 6: Reboot -> BIOS -> Enable Secure Boot -> Boot
+# NOTE: This step currently fails due to GRUB shim_lock. See Known Issues.
 ```
-
-Or use the helper script: `sudo bash setup.sh`
-
----
-
-## Key Design Decisions
-
-- **Kernels** signed with sbsign (PE/COFF - correct for EFI binaries)
-- **Modules** signed with sign-file (PKCS#7 - what the kernel module loader verifies)
-- **.ko.zst** modules (Manjaro default) are decompressed before signing and recompressed afterward
-- **DER format** used consistently for all mokutil operations
-- **Path validation** prevents template injection in hooks and scripts
-
----
-
-## Security
-
-| Feature | Detail |
-|---------|--------|
-| Private key permissions | MOK.key = 0o600 |
-| Certificate permissions | MOK.crt and MOK.cer = 0o644 |
-| No shell=True | All subprocess calls use list-form arguments |
-| Path validation | _validate_safe_path() rejects shell metacharacters before template interpolation |
-| Idempotent | Safe to run multiple times |
 
 ---
 
 ## Helper Scripts
 
-| Script | Purpose |
-|--------|---------|
-| setup.sh | One-command dependency install + setup |
-| fix-boot-chain.sh | Copy shim to fallback EFI path |
-| sign-grub.sh | Sign GRUB with MOK key |
-| fix-grub-direct.sh | Restore/reinstall GRUB, sign directly |
-| recover-grub.sh | Emergency GRUB recovery |
+| Script | Purpose | Status |
+|--------|---------|--------|
+| sbctl-setup.sh | Install sbctl, create keys, sign EFI binaries | Working |
+| sign-remaining.sh | Sign any unsigned files flagged by sbctl verify | Working |
+| enroll-keys.sh | Enroll sbctl keys into UEFI firmware | Working |
+| fix-grub-shimlock.sh | Reinstall GRUB with --disable-shim-lock | Does not fix compiled-in verifier |
+| fix-grub-verifier.sh | Clean GRUB reinstall + config + re-sign | Does not fix compiled-in verifier |
+| setup.sh | Original MOK/shim approach (deprecated) | Superseded by sbctl |
+| fix-boot-chain.sh | Copy shim to EFI path (deprecated) | Superseded by sbctl |
+| sign-grub.sh | Sign GRUB with MOK key (deprecated) | Superseded by sbctl |
+| run.py | Python CLI for status/setup/sign | Working |
 
 ---
 
-## Running Tests
+## Python Module
+
+The repo also includes a Python secureboot automation module:
 
 ```bash
-pip install pytest
-PYTHONPATH=src pytest tests/test_secureboot.py -q
+# Check status
+sudo python run.py status
+
+# Full Python-based setup (MOK approach - deprecated in favor of sbctl)
+sudo python run.py setup
+
+# Re-sign kernels and modules
+sudo python run.py sign
+
+# Check EFI boot chain
+sudo python run.py check-efi
 ```
 
-55 tests, all mocked - no real sbsign, mokutil, or root required.
+55 tests, all passing. ruff clean. mypy clean.
+
+---
+
+## File Layout
+
+```
+sbctl-setup.sh               # Primary setup script (sbctl approach)
+sign-remaining.sh             # Sign any unsigned EFI files
+enroll-keys.sh                # Enroll keys into firmware
+fix-grub-verifier.sh          # Attempt to fix GRUB verifier
+run.py                        # Python CLI
+src/myproject/
+  secureboot.py               # Python secureboot module
+  kernel_builder.py            # Shared utilities
+  __init__.py
+tests/
+  test_secureboot.py           # 55 tests
+```
 
 ---
 
